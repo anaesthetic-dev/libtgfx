@@ -1,0 +1,91 @@
+name: Build TGFX with ANGLE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 9 * * 1'
+
+concurrency:
+  group: tgfx-windows-release
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: tgfx
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Tencent/tgfx
+          ref: main
+          path: tgfx
+          lfs: true
+          persist-credentials: false
+
+      - name: Install depsync
+        shell: bash
+        run: npm install -g depsync
+
+      - name: Build static library
+        shell: bash
+        run: |
+          depsync
+          compgen -G 'vendor/angle/win/x64/*.lib' > /dev/null || { echo 'Missing Windows x64 ANGLE libraries'; exit 1; }
+          node build_tgfx -p win -a x64 -DTGFX_USE_ANGLE=ON -DTGFX_BUILD_LAYERS=ON -DTGFX_BUILD_SVG=ON -DTGFX_BUILD_PDF=ON -o ./out/release/win
+
+      - name: Package library and headers
+        shell: pwsh
+        run: |
+          $libraries = @(Get-ChildItem out/release/win -Recurse -File -Filter tgfx.lib)
+          if ($libraries.Count -ne 1) { throw "Expected one tgfx.lib, found $($libraries.Count)" }
+          New-Item -ItemType Directory -Path package/lib | Out-Null
+          Copy-Item $libraries[0].FullName package/lib/
+          Copy-Item include package/ -Recurse
+          Copy-Item LICENSE.txt package/
+          Compress-Archive -Path package/* -DestinationPath tgfx-windows-x64-angle.zip
+
+      - name: Test packaged library
+        shell: pwsh
+        run: |
+          Expand-Archive tgfx-windows-x64-angle.zip smoke-package
+          cmake -S ../tests -B smoke-build -G "Visual Studio 17 2022" -A x64 "-DTGFX_PACKAGE=$PWD/smoke-package"
+          cmake --build smoke-build --config Release
+          ctest --test-dir smoke-build -C Release --output-on-failure
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tgfx-windows-x64-angle
+          path: tgfx/tgfx-windows-x64-angle.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = [regex]::Match((Get-Content CMakeLists.txt -Raw), '(?m)^set\(TGFX_VERSION\s+"([^"]+)"\)').Groups[1].Value
+          if (!$version) { throw 'TGFX_VERSION was not found in CMakeLists.txt' }
+          $tag = "v$version-$($sha.Substring(0, 12))"
+          $zip = 'tgfx-windows-x64-angle.zip'
+          $repo = $env:GITHUB_REPOSITORY
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --repo $repo --clobber
+          } else {
+            gh release create $tag $zip --repo $repo --target $env:GITHUB_SHA `
+              --title "TGFX $tag for Windows x64" `
+              --notes "TGFX source: https://github.com/Tencent/tgfx/commit/$sha"
+          }
+          exit $LASTEXITCODE

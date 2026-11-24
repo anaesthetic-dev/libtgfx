@@ -35,12 +35,40 @@ jobs:
         shell: bash
         run: npm install -g depsync
 
+      - name: Sync TGFX dependencies
+        shell: bash
+        run: depsync
+
+      - name: Install prebuilt static ANGLE
+        shell: pwsh
+        run: |
+          $tag = 'angle-8cf70e669c5e'
+          $url = "https://github.com/anaesthetic-dev/libangle/releases/download/$tag/angle-windows-x64-static.zip"
+          Invoke-WebRequest $url -OutFile angle.zip
+          if ((Get-FileHash angle.zip).Hash -ne 'A629BCD528D2E78FAFD24421CD9CCF9F3AA3EEC31F63BDF0262E006F73B786C4') {
+            throw 'Unexpected SHA-256 for the ANGLE archive'
+          }
+          Expand-Archive angle.zip static-angle
+          Remove-Item vendor/angle/win/x64, vendor/angle/include -Recurse
+          New-Item -ItemType Directory vendor/angle/win/x64 | Out-Null
+          Copy-Item static-angle/lib/libEGL_static.lib, static-angle/lib/libGLESv2_static.lib vendor/angle/win/x64/
+          Copy-Item static-angle/include vendor/angle/include -Recurse
+          Add-Content CMakeLists.txt "`ntarget_compile_definitions(tgfx PRIVATE ANGLE_STATIC=1 ANGLE_EXPORT= EGLAPI= GL_APICALL= GL_API=)"
+
+      - name: Configure the dynamic CRT for vendor builds
+        shell: pwsh
+        run: |
+          $path = 'third_party/vendor_tools/lib/CMake.js'
+          $source = Get-Content $path -Raw
+          $flag = '"-DCMAKE_C_FLAGS_RELEASE=/Zc:inline"'
+          if (!$source.Contains($flag)) { throw 'vendor_tools Windows CMake arguments changed' }
+          $source.Replace($flag, '"-DCMAKE_POLICY_DEFAULT_CMP0091=NEW", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL", ' + $flag) |
+            Set-Content $path -NoNewline
+
       - name: Build static library
         shell: bash
         run: |
-          depsync
-          compgen -G 'vendor/angle/win/x64/*.lib' > /dev/null || { echo 'Missing Windows x64 ANGLE libraries'; exit 1; }
-          node build_tgfx -p win -a x64 -DTGFX_USE_ANGLE=ON -DTGFX_BUILD_LAYERS=ON -DTGFX_BUILD_SVG=ON -DTGFX_BUILD_PDF=ON -o ./out/release/win
+          node build_tgfx -p win -a x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL -DTGFX_USE_ANGLE=ON -DTGFX_BUILD_LAYERS=ON -DTGFX_BUILD_SVG=ON -DTGFX_BUILD_PDF=ON -o ./out/release/win
 
       - name: Package library and headers
         shell: pwsh
@@ -51,6 +79,9 @@ jobs:
           Copy-Item $libraries[0].FullName package/lib/
           Copy-Item include package/ -Recurse
           Copy-Item LICENSE.txt package/
+          Copy-Item static-angle/include/* package/include/ -Recurse
+          Copy-Item static-angle/LICENSE package/LICENSE-ANGLE.txt
+          Copy-Item static-angle/BUILD_INFO.txt package/ANGLE-BUILD-INFO.txt
           Compress-Archive -Path package/* -DestinationPath tgfx-windows-x64-angle.zip
 
       - name: Test packaged library
